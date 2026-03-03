@@ -48,22 +48,28 @@ async function startServer() {
   // Auth Routes
   app.post("/api/auth/signup", (req, res) => {
     const { email, password, garageName } = req.body;
+    console.log(`Signup attempt: ${email}`);
     try {
       const hashedPassword = bcrypt.hashSync(password, 10);
       const stmt = db.prepare("INSERT INTO users (email, password, garageName) VALUES (?, ?, ?)");
-      stmt.run(email, hashedPassword, garageName);
-      res.json({ success: true, user: { email, garageName } });
+      stmt.run(email.toLowerCase(), hashedPassword, garageName);
+      console.log(`Signup success: ${email}`);
+      res.json({ success: true, user: { email: email.toLowerCase(), garageName } });
     } catch (error: any) {
+      console.error(`Signup error: ${error.message}`);
       res.status(400).json({ error: "Email already exists" });
     }
   });
 
   app.post("/api/auth/login", (req, res) => {
     const { email, password } = req.body;
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
+    console.log(`Login attempt: ${email}`);
+    const user = db.prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(?)").get(email) as any;
     if (user && bcrypt.compareSync(password, user.password)) {
+      console.log(`Login success: ${email}`);
       res.json({ success: true, user: { email: user.email, garageName: user.garageName } });
     } else {
+      console.log(`Login failed: ${email}`);
       res.status(401).json({ error: "Invalid credentials" });
     }
   });

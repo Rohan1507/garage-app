@@ -101,7 +101,7 @@ export default function App() {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password })
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password })
       });
       const data = await res.json();
       if (data.success) {
@@ -130,7 +130,7 @@ export default function App() {
       const res = await fetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, garageName })
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password, garageName })
       });
       const data = await res.json();
       if (data.success) {
