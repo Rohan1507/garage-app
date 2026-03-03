@@ -8,13 +8,52 @@ import {
   Plus, Search, LogOut, Phone, MessageSquare, Bell, 
   Wrench, Trash2, Edit2, Calendar, ChevronRight, 
   ArrowUpCircle, FileText, RefreshCw, CheckCircle2,
-  AlertCircle, Clock, Info
+  AlertCircle, Clock, Info, CloudOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import * as XLSX from 'xlsx';
 import { User, Vehicle, MAKES, OILS } from './types';
+
+// --- FIREBASE SETUP ---
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged,
+  updateProfile
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDocs, 
+  query, 
+  where, 
+  deleteDoc, 
+  updateDoc,
+  orderBy,
+  onSnapshot
+} from 'firebase/firestore';
+
+const firebaseConfig = {
+  apiKey: (import.meta as any).env.VITE_FIREBASE_API_KEY,
+  authDomain: (import.meta as any).env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: (import.meta as any).env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: (import.meta as any).env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: (import.meta as any).env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: (import.meta as any).env.VITE_FIREBASE_APP_ID
+};
+
+// Initialize Firebase only if config is present
+const isFirebaseEnabled = !!firebaseConfig.apiKey;
+const app = isFirebaseEnabled ? initializeApp(firebaseConfig) : null;
+const auth = app ? getAuth(app) : null;
+const db = app ? getFirestore(app) : null;
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -66,11 +105,34 @@ export default function App() {
 
   useEffect(() => {
     const timer = setTimeout(() => setSplash(false), 1500);
-    const savedUser = localStorage.getItem('gm_user');
-    if (savedUser) {
-      const u = JSON.parse(savedUser);
-      setUser(u);
-      fetchVehicles(u.email);
+    
+    if (isFirebaseEnabled && auth) {
+      const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+        if (firebaseUser) {
+          const u = { 
+            email: firebaseUser.email!, 
+            garageName: firebaseUser.displayName || 'My Garage' 
+          };
+          setUser(u);
+          fetchVehicles(u.email);
+        } else {
+          setUser(null);
+          setVehicles([]);
+        }
+      });
+      return () => {
+        unsubscribe();
+        clearTimeout(timer);
+      };
+    } else {
+      // Fallback to LocalStorage if Firebase is not configured
+      const savedUser = localStorage.getItem('gm_user');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        setUser(u);
+        const savedVehicles = localStorage.getItem(`gm_vehicles_${u.email}`);
+        if (savedVehicles) setVehicles(JSON.parse(savedVehicles));
+      }
     }
     return () => clearTimeout(timer);
   }, []);
@@ -80,28 +142,51 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const fetchVehicles = async (email: string) => {
-    setSyncing(true);
-    try {
-      const res = await fetch(`/api/vehicles?email=${email}`);
-      const data = await res.json();
-      setVehicles(data);
+  const fetchVehicles = async (userEmail: string) => {
+    if (isFirebaseEnabled && db) {
+      setSyncing(true);
+      try {
+        const q = query(collection(db, 'vehicles'), where('userEmail', '==', userEmail.toLowerCase()));
+        const querySnapshot = await getDocs(q);
+        const data = querySnapshot.docs.map(doc => doc.data() as Vehicle);
+        setVehicles(data);
+        setLastSync(new Date());
+      } catch (err) {
+        showToast('Failed to sync with Cloud', 'error');
+      } finally {
+        setSyncing(false);
+      }
+    } else {
+      // Local fallback
+      const saved = localStorage.getItem(`gm_vehicles_${userEmail}`);
+      if (saved) setVehicles(JSON.parse(saved));
       setLastSync(new Date());
-    } catch (err) {
-      showToast('Failed to sync data', 'error');
-    } finally {
-      setSyncing(false);
     }
   };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    const cleanEmail = email.trim().toLowerCase();
+
+    if (isFirebaseEnabled && auth) {
+      try {
+        await signInWithEmailAndPassword(auth, cleanEmail, password);
+        showToast('Welcome back!');
+      } catch (err: any) {
+        showToast(err.message || 'Login failed', 'error');
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    // Local Fallback
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim().toLowerCase(), password })
+        body: JSON.stringify({ email: cleanEmail, password })
       });
       const data = await res.json();
       if (data.success) {
@@ -113,7 +198,16 @@ export default function App() {
         showToast(data.error || 'Login failed', 'error');
       }
     } catch (err) {
-      showToast('Connection error', 'error');
+      showToast('Offline Mode: Using local data', 'info');
+      // Simple local check for demo purposes if server is down
+      const savedUser = localStorage.getItem('gm_user');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        if (u.email === cleanEmail) {
+          setUser(u);
+          fetchVehicles(u.email);
+        }
+      }
     } finally {
       setLoading(false);
     }
@@ -126,11 +220,29 @@ export default function App() {
       return;
     }
     setLoading(true);
+    const cleanEmail = email.trim().toLowerCase();
+
+    if (isFirebaseEnabled && auth) {
+      try {
+        const userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        await updateProfile(userCredential.user, { displayName: garageName });
+        const u = { email: cleanEmail, garageName };
+        setUser(u);
+        showToast('Account created!');
+      } catch (err: any) {
+        showToast(err.message || 'Signup failed', 'error');
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    // Local Fallback
     try {
       const res = await fetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim().toLowerCase(), password, garageName })
+        body: JSON.stringify({ email: cleanEmail, password, garageName })
       });
       const data = await res.json();
       if (data.success) {
@@ -142,14 +254,20 @@ export default function App() {
         showToast(data.error || 'Signup failed', 'error');
       }
     } catch (err) {
-      showToast('Connection error', 'error');
+      showToast('Offline Mode: Account created locally', 'info');
+      const u = { email: cleanEmail, garageName };
+      setUser(u);
+      localStorage.setItem('gm_user', JSON.stringify(u));
     } finally {
       setLoading(false);
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     if (confirm('Logout?')) {
+      if (isFirebaseEnabled && auth) {
+        await signOut(auth);
+      }
       setUser(null);
       localStorage.removeItem('gm_user');
       setVehicles([]);
@@ -182,12 +300,28 @@ export default function App() {
 
   const handleDelete = async (id: string, name: string) => {
     if (!confirm(`Delete ${name}?`)) return;
+    
+    if (isFirebaseEnabled && db) {
+      try {
+        await deleteDoc(doc(db, 'vehicles', id));
+        setVehicles(prev => prev.filter(v => v.id !== id));
+        showToast('Vehicle deleted');
+      } catch (err) {
+        showToast('Failed to delete from Cloud', 'error');
+      }
+      return;
+    }
+
     try {
       await fetch(`/api/vehicles/${id}`, { method: 'DELETE' });
       setVehicles(prev => prev.filter(v => v.id !== id));
       showToast('Vehicle deleted');
     } catch (err) {
-      showToast('Failed to delete', 'error');
+      // Local fallback
+      const updated = vehicles.filter(v => v.id !== id);
+      setVehicles(updated);
+      if (user) localStorage.setItem(`gm_vehicles_${user.email}`, JSON.stringify(updated));
+      showToast('Deleted locally');
     }
   };
 
@@ -357,8 +491,9 @@ export default function App() {
               <div className="flex items-center gap-1.5 mt-1">
                 <div className={cn("w-1.5 h-1.5 rounded-full", syncing ? "bg-blue animate-pdot" : "bg-green")} />
                 <div className="text-[10px] text-txt2 font-semibold">
-                  {syncing ? 'Syncing...' : `Synced · ${lastSync ? fmtSyncTime(lastSync) : 'Just now'}`}
+                  {syncing ? 'Syncing...' : isFirebaseEnabled ? `Synced · ${lastSync ? fmtSyncTime(lastSync) : 'Just now'}` : 'Offline Mode'}
                 </div>
+                {!isFirebaseEnabled && <CloudOff className="w-3 h-3 text-txt2" />}
               </div>
             </div>
           </div>
@@ -837,8 +972,29 @@ function Modal({ modal, onClose, vehicles, setVehicles, userEmail, garageName, s
     setLoading(true);
     const vData = {
       id: vehicle?.id || Date.now().toString(),
-      name, mobile, vn, make, model, date, km, dr, sdd
+      name, mobile, vn, make, model, date, km, dr, sdd,
+      userEmail: userEmail.toLowerCase()
     };
+
+    if (isFirebaseEnabled && db) {
+      try {
+        await setDoc(doc(db, 'vehicles', vData.id), vData);
+        if (modal.type === 'add') {
+          setVehicles(prev => [vData as Vehicle, ...prev]);
+          showToast('Vehicle added to Cloud');
+        } else {
+          setVehicles(prev => prev.map(v => v.id === modal.id ? { ...v, ...vData } as Vehicle : v));
+          showToast('Vehicle updated in Cloud');
+        }
+        onClose();
+      } catch (err) {
+        showToast('Failed to save to Cloud', 'error');
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     try {
       if (modal.type === 'add') {
         await fetch('/api/vehicles', {
@@ -854,12 +1010,22 @@ function Modal({ modal, onClose, vehicles, setVehicles, userEmail, garageName, s
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ vehicle: vData })
         });
-        setVehicles(prev => prev.map(v => v.id === modal.id ? { ...v, ...vData } : v));
+        setVehicles(prev => prev.map(v => v.id === modal.id ? { ...v, ...vData } as Vehicle : v));
         showToast('Vehicle updated');
       }
       onClose();
     } catch (err) {
-      showToast('Failed to save', 'error');
+      // Local fallback
+      let updated;
+      if (modal.type === 'add') {
+        updated = [vData as Vehicle, ...vehicles];
+      } else {
+        updated = vehicles.map(v => v.id === modal.id ? { ...v, ...vData } as Vehicle : v);
+      }
+      setVehicles(updated);
+      localStorage.setItem(`gm_vehicles_${userEmail}`, JSON.stringify(updated));
+      showToast('Saved locally');
+      onClose();
     } finally {
       setLoading(false);
     }
@@ -873,6 +1039,25 @@ function Modal({ modal, onClose, vehicles, setVehicles, userEmail, garageName, s
     }
     setLoading(true);
     const updatedVehicle = { ...vehicle!, lob: oil, lb: bill, sdd, km };
+
+    if (isFirebaseEnabled && db) {
+      try {
+        await updateDoc(doc(db, 'vehicles', modal.id), updatedVehicle);
+        setVehicles(prev => prev.map(v => v.id === modal.id ? updatedVehicle : v));
+        
+        const msg = `Hello ${vehicle?.name}! 🙏\n\n✅ *Service Completed* at ${garageName}\n\n🏍️ *${vehicle?.vn}*\n${vehicle?.make} ${vehicle?.model}${km ? `\n📊 KM: *${Number(km).toLocaleString()}*` : ''}\n\n🛢️ Oil: *${oil}*\n💰 Bill: *₹${bill}*\n📅 Next Service: *${sdd}*\n\nThank you! 🙌`;
+        window.open(`https://wa.me/91${vehicle?.mobile}?text=${encodeURIComponent(msg)}`, '_blank');
+        
+        showToast('Service logged to Cloud!');
+        onClose();
+      } catch (err) {
+        showToast('Failed to log to Cloud', 'error');
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     try {
       await fetch(`/api/vehicles/${modal.id}`, {
         method: 'PUT',
@@ -887,7 +1072,12 @@ function Modal({ modal, onClose, vehicles, setVehicles, userEmail, garageName, s
       showToast('Service logged!');
       onClose();
     } catch (err) {
-      showToast('Failed to log service', 'error');
+      // Local fallback
+      const updated = vehicles.map(v => v.id === modal.id ? updatedVehicle : v);
+      setVehicles(updated);
+      localStorage.setItem(`gm_vehicles_${userEmail}`, JSON.stringify(updated));
+      showToast('Logged locally');
+      onClose();
     } finally {
       setLoading(false);
     }
